@@ -174,26 +174,21 @@ For more visualizations, please visit the project website:
 
 
 ## Citation
+```
+@misc{lee2026topdowntrafficscenariogeneration,
+      title={Top-down Traffic Scenario Generation via Joint Initial-Goal Diffusion and Trajectory Infilling}, 
+      author={Da Saem Lee and Yash Vardhan Pant and Sebastian Fischmeister},
+      year={2026},
+      eprint={2608.11407},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2608.11407}, 
+}
+```
+## Acknowledgement
 This code is based on [Optimizing Diffusion Models for Joint Trajectory Prediction and Controllable Generation](https://github.com/YixiaoWang7/OptTrajDiff), [Query-Centric Trajectory Prediction](https://github.com/ZikangZhou/QCNet), and [Path Diffuser: Diffusion Model for Data-Driven Traffic Simulator](https://github.com/CL2-UWaterloo/PathDiffuser)
 Please also consider citing:
 
-```
-@inproceedings{zhou2023query,
-  title={Query-Centric Trajectory Prediction},
-  author={Zhou, Zikang and Wang, Jianping and Li, Yung-Hui and Huang, Yu-Kai},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year={2023}
-}
-```
-```
-@inproceedings{wang2025optimizing,
-  title={Optimizing diffusion models for joint trajectory prediction and controllable generation},
-  author={Wang, Yixiao and Tang, Chen and Sun, Lingfeng and Rossi, Simone and Xie, Yichen and Peng, Chensheng and Hannagan, Thomas and Sabatini, Stefano and Poerio, Nicola and Tomizuka, Masayoshi and others},
-  booktitle={European Conference on Computer Vision},
-  pages={324--341},
-  year={2025},
-  organization={Springer}
-}
 ```@INPROCEEDINGS{lee2025pathdiffuserdiffusionmodel,
   author={Lee, Da Saem and Karthikeyan, Akash and Pant, Yash Vardhan and Fischmeister, Sebastian},
   booktitle={2025 IEEE 28th International Conference on Intelligent Transportation Systems (ITSC)}, 
@@ -204,3 +199,22 @@ Please also consider citing:
   pages={569-576},
   keywords={Training;Measurement;Dimensionality reduction;Weather;Adaptation models;Roads;Perturbation methods;Diffusion models;Controllability;Trajectory},
   doi={10.1109/ITSC60802.2025.11423013}}
+```
+```
+@inproceedings{wang2025optimizing,
+  title={Optimizing diffusion models for joint trajectory prediction and controllable generation},
+  author={Wang, Yixiao and Tang, Chen and Sun, Lingfeng and Rossi, Simone and Xie, Yichen and Peng, Chensheng and Hannagan, Thomas and Sabatini, Stefano and Poerio, Nicola and Tomizuka, Masayoshi and others},
+  booktitle={European Conference on Computer Vision},
+  pages={324--341},
+  year={2025},
+  organization={Springer}
+}
+```
+```
+@inproceedings{zhou2023query,
+  title={Query-Centric Trajectory Prediction},
+  author={Zhou, Zikang and Wang, Jianping and Li, Yung-Hui and Huang, Yu-Kai},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2023}
+}
+```
