@@ -1,0 +1,425 @@
+# Copyright (c) 2023, Zikang Zhou. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from email import parser
+import os
+import numpy as np
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch_geometric.data import Batch
+from torch_geometric.data import HeteroData
+from torch_cluster import radius
+import pytorch_lightning as pl
+
+
+from metrics import  OffRoad, Collision, NearestEdge
+from metrics import JSD_SPEED, JSD_MAP_DIST, JSD_INTERACTIVE, JSD_LOCAL_DENSITY
+
+from module_hl_generation import TDMapEncoder, HLDiffusion
+
+from av2.datasets.motion_forecasting import scenario_serialization
+from av2.map.map_api import ArgoverseStaticMap
+
+from visualization import *
+
+class HLTrafficGen(pl.LightningModule):
+
+    def __init__(self,
+                 args,
+                 **kwargs) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+        self.dataset = args.dataset
+        self.input_dim = args.input_dim
+        self.hidden_dim = args.hidden_dim
+        self.output_dim = args.output_dim
+        self.output_head = args.output_head
+        self.init_timestep = args.init_timestep
+        self.num_freq_bands = args.num_freq_bands
+        self.num_map_layers = args.num_map_layers
+        self.num_dec_layers = args.num_dec_layers
+        self.num_heads = args.num_heads
+
+        self.head_dim = args.head_dim
+        self.dropout = args.dropout
+        self.pl2pl_radius = args.pl2pl_radius
+
+        self.lr = args.lr
+        self.weight_decay = args.weight_decay
+        self.T_max = args.T_max
+
+        self.sampling = args.sampling
+        self.sampling_stride = args.sampling_stride
+        self.num_diffusion_steps = args.num_diffusion_steps
+
+        self.m_dim = args.m_dim
+        self.root = args.root
+        self.T = 2
+        
+        self.check_param()
+
+        self.td_mapencoder = TDMapEncoder(dataset=args.dataset,
+                                                input_dim=self.input_dim,
+                                                hidden_dim=self.hidden_dim,
+                                                pl2pl_radius=self.pl2pl_radius,
+                                                num_freq_bands=self.num_freq_bands,
+                                                num_layers=self.num_map_layers,
+                                                num_heads=self.num_heads,
+                                                head_dim=self.head_dim,
+                                                dropout=self.dropout)
+        self.device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.hl_diffusion = HLDiffusion(args=args)
+
+        self.OffRoad =  nn.ModuleList([OffRoad() for _ in range(self.T)])
+        self.Collision = nn.ModuleList([Collision() for _ in range(self.T)])
+        self.NearestEdge = nn.ModuleList([NearestEdge() for _ in range(self.T)])
+
+        self.OffRoad_gt = nn.ModuleList([OffRoad() for _ in range(self.T)])
+        self.Collision_gt = nn.ModuleList([Collision() for _ in range(self.T)])
+        self.NearestEdge_gt = nn.ModuleList([NearestEdge() for _ in range(self.T)])
+
+        self.JSD_MAP_DIST = nn.ModuleList([JSD_MAP_DIST() for _ in range(self.T)])
+        self.JSD_LOCAL_DENSITY = nn.ModuleList([JSD_LOCAL_DENSITY() for _ in range(self.T)])
+        self.JSD_INTERACTIVE = nn.ModuleList([JSD_INTERACTIVE() for _ in range(self.T)])
+        self.JSD_SPEED = nn.ModuleList([JSD_SPEED() for _ in range(self.T)])
+
+        self.eval_line = torch.tensor([[0, 0], [1, 0], [2, 0], [3, 0]]).float()
+        stats = torch.load('stats.pt')
+        self.m_mean = stats['mean']
+        self.m_std = stats['std']
+
+    def add_extra_param(self, args):
+        self.guid_sampling = args.guid_sampling
+        self.hl_diffusion.guid_sampling = args.guid_sampling
+        self.guid_task = args.guid_task
+        self.guid_plot = args.guid_plot
+
+        self.cond_norm = args.cond_norm
+        self.cost_param_costl = args.cost_param_costl
+        self.cost_param_threl = args.cost_param_threl
+
+        self.plot = args.plot
+        self.root = args.root
+        if args.__contains__('ckpt_path'):
+            self.ckpt_path = args.ckpt_path
+        else:
+            self.ckpt_path = None
+        
+    def check_param(self):
+        if self.sampling == 'ddpm':
+            self.sampling_stride = 1
+        elif self.sampling == 'ddim':
+            self.sampling_stride = int(self.sampling_stride)
+            if self.sampling_stride > self.num_diffusion_steps - 1:
+                print('ddim stride > diffusion steps.')
+                exit()
+            scale = self.num_diffusion_steps / self.sampling_stride
+            if abs(scale - int(scale)) > 0.00001:
+                print('mod(diffusion steps, ddim stride) != 0')
+                exit()
+
+    def forward(self, data: HeteroData):
+        scene_enc = self.td_mapencoder(data)
+        x = torch.ones(32,10).to(scene_enc['x_a'].device)
+        return self.linear(x)
+    
+    def create_rot_mat(self, theta, num_agents):
+        if theta.dim() == 1:
+            cos, sin = theta.cos(), theta.sin()
+            mat = torch.zeros(num_agents, 2, 2, device=theta.device)
+            mat[:, 0, 0] = cos
+            mat[:, 0, 1] = -sin
+            mat[:, 1, 0] = sin
+            mat[:, 1, 1] = cos
+            
+        elif theta.dim() == 2:
+            num_agents, num_samples = theta.shape
+            cos, sin = theta.cos(), theta.sin()
+            mat = torch.zeros(num_agents, num_samples, 2, 2, device=theta.device)
+            mat[:, :, 0, 0] = cos
+            mat[:, :, 0, 1] = -sin
+            mat[:, :, 1, 0] = sin
+            mat[:, :, 1, 1] = cos
+        return mat
+
+    def training_step(self,
+                      data,
+                      batch_idx):
+        
+        print_flag = False
+        if batch_idx % 100 == 0:
+            print_flag = True
+        if isinstance(data, Batch):
+            data['agent']['av_index'] += data['agent']['ptr'][:-1]
+        
+        scene_enc = self.td_mapencoder(data)
+
+        eval_mask = data['agent']['mask']
+        reg_mask = data['agent']['predict_mask'][eval_mask, self.init_timestep:]
+
+        gt = torch.cat([data['agent']['target'][..., :self.output_dim], data['agent']['target'][..., -1:]], dim=-1)
+        gt = gt[eval_mask][..., :self.output_dim]
+        
+        gt_trans = data['agent']['scaled_position'][eval_mask,  self.init_timestep:]
+        
+        gt_speed = data['agent']['velocity'][eval_mask, self.init_timestep:]
+        gt_speed = torch.norm(gt_speed, p=2, dim=-1) / 15 - 1
+
+        gt_init = torch.cat([gt_trans[:, 0], gt_speed[:, 0].unsqueeze(-1)], dim=-1)
+        gt_final = torch.cat([gt_trans[:, -1], gt_speed[:, -1].unsqueeze(-1)], dim=-1)
+
+        self.load_vars(gt_init.device)
+
+        gt_init = (gt_init - self.m_mean) / self.m_std
+        gt_final = (gt_final - self.m_mean) / self.m_std
+        m_init = torch.cat([gt_init, gt_final], dim=-1)
+
+        loss_diff, pred_init, entropy_mean = self.hl_diffusion.get_loss(m_init, data = data, scene_enc = scene_enc,eval_mask=eval_mask)
+        pred_init[...,:3] = pred_init[...,:3] * self.m_std + self.m_mean
+
+        pred_init[...,3:] = pred_init[...,3:] * self.m_std + self.m_mean
+        pred_trans_init, pred_speed_init = pred_init[..., :2],  pred_init[..., 2]
+        pred_trans_final, pred_speed_final = pred_init[..., 3:5], pred_init[..., -1]
+
+        agent_batch = data['agent']['batch'][eval_mask]
+        map_min = data['map_min'].view(-1, 3)[..., :2][agent_batch]
+        map_max = data['map_max'].view(-1, 3)[..., :2][agent_batch]
+
+
+        target_init = gt_trans[:, 0]
+        target_final = gt_trans[:, -1]
+        target_speed_init = gt_speed[:, 0]
+        target_speed_final = gt_speed[:, -1]
+        
+        pred_trans_init = (pred_trans_init + 1) * (map_max - map_min) / 2 + map_min
+        target_init = (target_init + 1) * (map_max - map_min) / 2 + map_min
+        
+        pred_trans_final = (pred_trans_final + 1) * (map_max - map_min) / 2 + map_min
+        target_final = (target_final + 1) * (map_max - map_min) / 2 + map_min
+
+        loss_trans_init = torch.nn.HuberLoss()(pred_trans_init, target_init)
+        loss_trans_final = torch.nn.HuberLoss()(pred_trans_final, target_final)
+        loss_speed_init = torch.nn.HuberLoss()(pred_speed_init, target_speed_init)
+        loss_speed_final = torch.nn.HuberLoss()(pred_speed_final, target_speed_final)
+        
+        loss_trans = loss_trans_init + loss_trans_final
+        loss_speed = loss_speed_init + loss_speed_final
+
+        self.log('train_lr', self.optimizers().param_groups[0]['lr'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        
+        loss_diff_init = loss_diff.mean() + entropy_mean * 0.1
+        loss_diff_pos = loss_diff[...,:2].mean()
+        loss_diff_speed = loss_diff[...,4].mean()
+        self.log('train/loss_diff_pos', loss_diff_pos, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('train/loss_diff_speed', loss_diff_speed, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('train/loss_diff_init', loss_diff_init, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('train/entropy_mean', entropy_mean, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        
+        self.log('train/trans_loss', loss_trans, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('train/speed_loss', loss_speed, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+
+        if print_flag:
+            print(f'{batch_idx}, loss_diff_init: {loss_diff_init.item():.5f}, trans_loss: {loss_trans.item():.5f}, speed_loss:{loss_speed.item():.5f})')
+            
+        return loss_diff_init
+
+
+    def validation_step(self,
+                    data,
+                    batch_idx):
+        if self.guid_sampling == 'no_guid':
+            self.validation_step_norm(data, batch_idx)
+        elif self.guid_sampling == 'guid':
+            self.validation_step_guid(data, batch_idx)
+        
+    def load_vars(self, device):
+        if  self.m_mean.device != device:
+             self.m_mean =  self.m_mean.to(device)
+             self.m_std =  self.m_std.to(device)
+
+    def validation_step_norm(self,
+                    data,
+                    batch_idx):
+        print_flag = False
+        if batch_idx % 100 == 0:
+            print_flag = True
+            
+        data_batch = batch_idx
+        if isinstance(data, Batch):
+            data['agent']['av_index'] += data['agent']['ptr'][:-1]
+        
+        scene_enc = self.td_mapencoder(data)
+    
+        gt = torch.cat([data['agent']['target'][..., :self.output_dim], data['agent']['target'][..., -1:]], dim=-1)
+
+        self.load_vars(self.device)
+        mask = data['agent']['mask']
+        
+        gt_n = gt[mask][..., :self.output_dim]
+        device = gt_n.device
+        if self.dataset == 'argoverse_v2':
+            eval_mask = data['agent']['mask']
+        else:
+            raise ValueError('{} is not a valid dataset'.format(self.dataset))
+        
+        self.hl_diffusion.eval()
+
+        if_output_diffusion_process = False
+        self.load_vars(device)
+
+        gt_trans = data['agent']['scaled_position'][eval_mask,  self.init_timestep:]
+        
+        gt_speed = data['agent']['velocity'][eval_mask, self.init_timestep:]
+        gt_speed = torch.norm(gt_speed, p=2, dim=-1) / 15 - 1
+
+        if if_output_diffusion_process:
+            reverse_steps = self.num_diffusion_steps
+            pred_modes, _ = self.hl_diffusion.sample(data = data, scene_enc = scene_enc, 
+                                                    sampling=self.sampling,
+                                                    stride=self.sampling_stride, eval_mask=eval_mask,
+                                                    if_output_diffusion_process=if_output_diffusion_process,
+                                                    reverse_steps=reverse_steps)
+
+            agent_batch = data['agent']['batch'][eval_mask]
+            map_min = data['map_min'].view(-1, 3)[..., :2][agent_batch]
+            map_max = data['map_max'].view(-1, 3)[..., :2][agent_batch]
+
+            pred_init = pred_modes[-1]
+
+            inter_latents = pred_modes[::1]
+            inter_trajs = []
+            for latent in inter_latents:
+
+                latent[...,:3] = latent[...,:3] * self.m_std + self.m_mean
+
+                latent[...,3:] = latent[...,3:] * self.m_std + self.m_mean
+                pred_trans_init, pred_speed_init = latent[..., :2],  latent[..., 2]
+                pred_trans_final, pred_speed_final = latent[..., 3:5], latent[..., -1]
+
+
+                pred_trans_init = (pred_trans_init + 1) * (map_max - map_min) / 2 + map_min
+                pred_trans_final = (pred_trans_final + 1) * (map_max - map_min) / 2 + map_min
+                
+                rec_traj = torch.cat([pred_trans_init.unsqueeze(1), pred_trans_final.unsqueeze(1)], dim=1).detach().cpu().numpy()
+                inter_trajs.append(rec_traj)
+            
+        else:
+            reverse_steps = None
+            pred_init, _ = self.hl_diffusion.sample(data = data, scene_enc = scene_enc,
+                                                    sampling=self.sampling,
+                                                    stride=self.sampling_stride,eval_mask=eval_mask,
+                                                    if_output_diffusion_process=if_output_diffusion_process,
+                                                    reverse_steps=reverse_steps)
+
+        agent_batch = data['agent']['batch'][eval_mask]
+        map_min = data['map_min'].view(-1, 3)[..., :2][agent_batch]
+        map_max = data['map_max'].view(-1, 3)[..., :2][agent_batch]
+
+        pred_init[...,:3] = pred_init[...,:3] * self.m_std + self.m_mean
+        pred_trans_init, pred_speed_init = pred_init[..., :2],  pred_init[..., 2]
+        pred_trans_init = (pred_trans_init + 1) * (map_max - map_min) / 2 + map_min
+
+        pred_init[...,3:] = pred_init[...,3:] * self.m_std + self.m_mean
+        pred_trans_final, pred_speed_final = pred_init[..., 3:5], pred_init[..., -1]
+        pred_trans_final = (pred_trans_final + 1) * (map_max - map_min) / 2 + map_min
+        
+        # find closest map point and add map orientation
+        max_num_neighbors = data['map_point']['batch']
+        max_num_neighbors = max_num_neighbors.bincount().max().item()
+        edge_init2m = radius(x=pred_trans_init[..., :2], y=data['map_point']['position'][..., :2], r=4, max_num_neighbors=max_num_neighbors)
+        dist = torch.norm(pred_trans_init[..., :2][edge_init2m[1]] - data['map_point']['position'][edge_init2m[0], :2], dim=-1)
+        heading_init = torch.zeros_like(pred_trans_init[..., 0])
+        for agent_i in edge_init2m[1].unique():
+            agent_i_mask = torch.where(edge_init2m[1] == agent_i)[0]
+            if len(agent_i_mask) == 0:
+                continue
+            min_dist_idx = torch.argmin(dist[agent_i_mask])
+            min_dist_idx = edge_init2m[0][agent_i_mask[min_dist_idx]]
+            heading_init[agent_i] = data['map_point']['orientation'][min_dist_idx]
+            
+        edge_final2m = radius(x=pred_trans_final[..., :2], y=data['map_point']['position'][..., :2], r=4, max_num_neighbors=max_num_neighbors)
+        dist = torch.norm(pred_trans_final[..., :2][edge_final2m[1]] - data['map_point']['position'][edge_final2m[0], :2], dim=-1)
+        heading_final = torch.zeros_like(pred_trans_final[..., 0])
+        for agent_i in edge_final2m[1].unique():
+            agent_i_mask = torch.where(edge_final2m[1] == agent_i)[0]
+            if len(agent_i_mask) == 0:
+                continue
+            min_dist_idx = torch.argmin(dist[agent_i_mask])
+            min_dist_idx = edge_final2m[0][agent_i_mask[min_dist_idx]]
+            heading_final[agent_i] = data['map_point']['orientation'][min_dist_idx]
+            
+        pred_trans =  torch.stack([pred_trans_init,  pred_trans_final], dim=1)
+
+        pred_speed = torch.stack([pred_speed_init, pred_speed_final], dim=1)
+        pred_speed = (pred_speed + 1) * 15
+
+        if True in torch.isnan(pred_trans_init):
+            print('nan')
+            print(data_batch)
+            exit()
+
+        batch_idx = data['agent']['batch'][eval_mask]
+        num_scenes = batch_idx[-1].item()+1
+        num_agents_per_scene = pred_trans_init.new_tensor([(batch_idx == i).sum() for i in range(num_scenes)]).type(torch.int64)
+        
+    
+        origin_init_eval = data['agent']['position'][eval_mask, self.init_timestep, :2]
+        origin_final_eval = data['agent']['position'][eval_mask, -1, :2]
+
+        gt_trans =  torch.stack([origin_init_eval, origin_final_eval], dim=1)
+        
+        
+        gt_init = torch.cat([gt_trans], dim=-1)
+        pred_init = torch.cat([pred_trans], dim=-1)
+        
+        gt_speed = data['agent']['velocity']
+        gt_speed = torch.norm(gt_speed, dim=-1)
+        gt_init_speed = torch.stack([gt_speed[eval_mask, self.init_timestep],
+                                    gt_speed[eval_mask, -1]], dim=1)
+        trans_loss = torch.nn.MSELoss()(pred_trans, gt_trans)
+
+        self.log('val_trans_loss', trans_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+        for i in range(self.T):
+            self.JSD_LOCAL_DENSITY[i].update(pred=pred_init[:, i], gt=gt_init[:, i], agent_batch=agent_batch, data=data)
+            self.log(f'val/jsd_local_density_{i}', self.JSD_LOCAL_DENSITY[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+            self.JSD_INTERACTIVE[i].update(pred_init[:, i], gt_init[:, i], agent_batch=agent_batch)
+            self.log(f'val/jsd_interactive_{i}', self.JSD_INTERACTIVE[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.JSD_MAP_DIST[i].update(pred=pred_init[:, i], gt=gt_init[:, i], agent_batch=agent_batch, map_pts=data['map_point'])
+            self.log(f'val/jsd_map_dist_{i}', self.JSD_MAP_DIST[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.JSD_SPEED[i].update(pred_speed[:, i], gt_init_speed[:, i])
+            self.log(f'val/jsd_speed_{i}', self.JSD_SPEED[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.OffRoad[i].update(pred=pred_trans[:, i], agent_batch=agent_batch, map_pts=data['map_point'])
+            self.log(f'val/offroad_rate_{i}', self.OffRoad[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+            self.NearestEdge[i].update(pred=pred_trans[:, i], agent_batch=agent_batch, map_pts=data['map_point'])
+            self.log(f'val/nearest_edge_dist_{i}', self.NearestEdge[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+            self.Collision[i].update(pred=pred_trans[:, i], agent_batch=agent_batch, agent_type=data['agent']['type'][eval_mask])
+            self.log(f'val/collision_rate_{i}', self.Collision[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.OffRoad_gt[i].update(pred=gt_trans[:, i],agent_batch=agent_batch, map_pts=data['map_point'])
+            self.log(f'val/offroad_rate_gt_{i}', self.OffRoad_gt[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.NearestEdge_gt[i].update(pred=gt_trans[:, i],agent_batch=agent_batch, map_pts=data['map_point'])
+            self.log(f'val/nearest_edge_dist_gt_{i}', self.NearestEdge_gt[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+
+            self.Collision_gt[i].update(pred=gt_trans[:, i], agent_batch=agent_batch, agent_type=data['agent']['type'][eval_mask])
+            self.log(f'val/collision_rate_gt_{i}', self.Collision_gt[i], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
+        
+        self.log(f'val_offroad_rate', self.OffRoad[0], prog_bar=True, on_step=False, on_epoch=True, batch_size=len(data['scenario_id']),sync_dist=True)
