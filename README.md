@@ -1,6 +1,6 @@
 # TrafficDiffuser
 
-This repository is the official github repository for [TrafficDiffuser].
+This repository is the official github repository for TrafficDiffuser.
 
  [![Project Page](https://img.shields.io/badge/Project-Website-orange)](https://dasaemlee.github.io/projects/trafficdiffuser/) 
  [![arXiv](https://img.shields.io/badge/arXiv-COVE-b31b1b.svg)](https://arxiv.org/abs/2608.11407) 
